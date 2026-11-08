@@ -38,7 +38,11 @@ flowchart TD
 ```
 
 <p align="center">
-  <img src="img/architecture.jpg" alt="System Architecture Schematic" width="100%" />
+  <img src="img/hld_architecture.png" alt="High-Level System Architecture (HLD)" width="100%" />
+</p>
+
+<p align="center">
+  <img src="img/lld_architecture.png" alt="Low-Level System Architecture (LLD)" width="100%" />
 </p>
 
 ---
