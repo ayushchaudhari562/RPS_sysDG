@@ -1,0 +1,13 @@
+{
+  "name": "node-baseline",
+  "version": "1.0.0",
+  "description": "Node.js multi-core baseline benchmark server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.1"
+  }
+}

@@ -1,0 +1,27 @@
+# Environment & Secrets
+.env
+*.local
+
+# Compiled binaries
+*.exe
+server_linux
+test_linux
+bench/seed/seed.exe
+bench/chaosclient/chaosclient.exe
+
+# Dead letter log
+dead_letter.jsonl
+
+# Profiling and dump files
+*.pb.gz
+*.prof
+*.pprof
+
+# Node dependencies
+bench/node/node_modules/
+bench/node/package-lock.json
+
+# Bench results (ignore all except representative checked-in baseline)
+bench/results/*
+!bench/results/baseline/
+!bench/results/baseline/**
