@@ -31,20 +31,14 @@ import (
 )
 
 var (
-	
 	dbPool *pgxpool.Pool
-
 	redisClient rueidis.Client
 )
 
 var (
-	
 	writeQueue = make(chan Item, 200000)
-
 	doneChan = make(chan struct{})
-
 	redisQueue = make(chan []Item, 100)
-
 	totalWrites        int64 
 	acceptedWrites     int64 
 	rejectedFullWrites int64 
