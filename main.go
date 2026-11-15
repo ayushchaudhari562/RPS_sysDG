@@ -882,11 +882,7 @@ func main() {
 	port := getEnvWithFile("PORT", "8081")
 	metricsAddr := getEnvWithFile("METRICS_ADDR", "127.0.0.1:6060")
 
-	log.Println("==========================================================")
-	log.Printf(" 🚀 Go HTTP engine benchmark suite")
-	log.Printf(" Starting server on :%s using %d cores (SO_REUSEPORT)", port, numCores)
-	log.Println("==========================================================")
-
+	
 	initDB()
 	initData()
 	initRedis()
