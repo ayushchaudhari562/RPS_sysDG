@@ -139,6 +139,8 @@ Requests/sec: 49113.20
 Transfer/sec:     30.15MB
 ```
 
+> ⚠️ **Data-quality note (added during code review):** in this capture p99 (6.62 ms) is *lower* than p90 (6.85 ms), which is impossible for a real latency distribution, so this output was likely edited or mixed from two runs. Also, at the time of this run `/code-db` returned malformed JSON (missing `"` after the code value; wrk only counts status codes). Both are fixed/flagged; **re-run this benchmark before quoting it.**
+
 **Little's Law Validation:**  
 With 200 in-flight connections and ~4.01 ms average latency:
 $$\text{Expected Throughput} \approx \frac{200 \text{ connections}}{0.00401 \text{ s}} \approx \mathbf{49,875 \text{ req/s}}$$
@@ -168,7 +170,8 @@ Transfer/sec:     31.56MB
 * **Metrics Verification at End of Run (from `:6060/metrics`):**
   * `accepted_writes`: `2,465,348`
   * `persisted_writes`: `2,464,962`
-  * Invariant: $\text{accepted} == \text{persisted} + \text{failed} + \text{pending} + \text{queue\_depth}$ holds with 0 rejected writes.
+  * Invariant: $\text{accepted} == \text{persisted} + \text{failed} + \text{pending} + \text{queue\_depth}$ reported as holding with 0 rejected writes.
+  * ⚠️ At the time, `/metrics` *derived* `pending` from the other counters, so `invariant_holds` could never be false. It now uses an independent counter (see `metrics.go`, `TestInvariant`). The external check (chaos client's ACK file vs `SELECT count(*)`) was always independent and remains valid.
 
 ---
 
@@ -182,55 +185,8 @@ Transfer/sec:     31.56MB
 
 ## 4. Bisection & Fault-Tolerance Verification
 
-### The Real Bisection & Retry Implementation in `main.go`
-Verbatim code from `main.go` (Lines 500–554) governing batch flushing, exponential backoff retries, and permanent error bisection:
-
-```go
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		err = flushBatchToDB(batch)
-		if err == nil {
-			atomic.AddInt64(&persistedWrites, int64(len(batch)))
-			atomic.AddInt64(&pendingInBatches, -int64(len(batch)))
-
-			if redisClient != nil && len(batch) > 0 {
-				redisBatch := make([]Item, len(batch))
-				copy(redisBatch, batch)
-				select {
-				case redisQueue <- redisBatch:
-				default:
-					atomic.AddInt64(&redisDroppedWrites, int64(len(batch)))
-					atomic.AddInt64(&redisErrors, int64(len(batch)))
-				}
-			}
-			return
-		}
-
-		if isPermanentError(err) {
-			break
-		}
-
-		time.Sleep(time.Duration(50<<attempt) * time.Millisecond)
-	}
-
-	if isPermanentError(err) {
-		if len(batch) == 1 {
-			recordDeadLetter(batch[0], err)
-			atomic.AddInt64(&failedWrites, 1)
-			atomic.AddInt64(&pendingInBatches, -1)
-			return
-		}
-
-		mid := len(batch) / 2
-		flushBatchWithRetryAndBisection(batch[:mid])
-		flushBatchWithRetryAndBisection(batch[mid:])
-		return
-	}
-
-	log.Printf("ERROR: Batch flush failed after 3 retries (%d items dropped): %v", len(batch), err)
-	atomic.AddInt64(&failedWrites, int64(len(batch)))
-	atomic.AddInt64(&pendingInBatches, -int64(len(batch)))
-```
+### Implementation
+Retry and bisection live in `flush()` in [`writer.go`](writer.go): transient errors retry 3× with 50/100/200 ms backoff; a permanent error (SQLSTATE class 22/23) splits the batch in half recursively until the single bad row is written to `dead_letter.jsonl`.
 
 ---
 
@@ -287,7 +243,6 @@ pkg: go-1m-rps
 cpu: 13th Gen Intel(R) Core(TM) i5-13450HX
 BenchmarkHandler_Simple-16                  	49106064	        24.77 ns/op	       0 B/op	       0 allocs/op
 BenchmarkHandler_CodeFast-16                	29034247	        42.35 ns/op	       0 B/op	       0 allocs/op
-BenchmarkHandler_CodeRedis_Hit-16           	37017728	        32.75 ns/op	       0 B/op	       0 allocs/op
 BenchmarkHandler_CodeWrite_CustomBody-16    	 1849712	       639.9 ns/op	     360 B/op	       9 allocs/op
 BenchmarkHandler_CodeWrite_EmptyBody-16     	 2450901	       494.8 ns/op	     249 B/op	       4 allocs/op
 PASS
@@ -295,7 +250,7 @@ ok  	go-1m-rps	9.680s
 ```
 
 * **`/simple` & `/code-fast`:** **0 B/op, 0 allocs/op (VERIFIED at handler level)**.
-* **`/code-redis` Allocation Caveat:** In `BenchmarkHandler_CodeRedis_Hit`, `redisClient` was nil, measuring the in-memory fallback. In real production execution, building Redis keys and parsing RESP3 structures causes small heap allocations. We explicitly do **NOT** claim zero allocations for the live Redis route.
+* **`/code-redis` Allocation Caveat:** The old `BenchmarkHandler_CodeRedis_Hit` ran with `redisClient == nil`, so it measured the 503 path, not a cache hit; it has been removed. In real production execution, building Redis keys and parsing RESP3 structures causes small heap allocations. We explicitly do **NOT** claim zero allocations for the live Redis route.
 * **Race Detector Status:** Pure Go unit tests pass 100%. Host environment lacks a 64-bit CGO GCC compiler, so `-race` flag was not run; we do not claim formal "race-free" certification.
 
 ---
@@ -335,13 +290,9 @@ Showing top 15 nodes out of 91
 
 | Asset File | Description |
 |:---|:---|
-| `img/architecture.jpg` | Complete system schematic: L4 SO_REUSEPORT, fasthttp, 3-tier storage hierarchy. |
 | `img/latency_hierarchy.jpg` | Conceptual latency step-down curve: L1 RAM ➔ L2 Redis ➔ L3 DB. |
 | `img/write_behind.jpg` | Asynchronous write-behind batching pipeline and recursive bisection diagram. |
 | `img/kernel_load_balancer.png` | Linux kernel 4-tuple hash balancing across 16 listener sockets. |
-| `img/wrk_843k_benchmark.png` | Terminal run capture of sustained >800k RPS benchmark. |
-| `img/wrk_1m_benchmark.png` | *(Historical prototype capture under exploratory synthetic burst settings).* |
-| `img/pm2_vs_gmp.jpg` | *(Conceptual diagram comparing Node.js multi-process vs Go GMP concurrency).* |
 
 ---
 

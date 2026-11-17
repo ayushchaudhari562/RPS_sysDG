@@ -2,447 +2,291 @@ package main
 
 import (
 	"encoding/json"
-	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
-	"sync/atomic"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/valyala/fasthttp"
 )
 
-func invokeFastHandler(method, uri string, body []byte) *fasthttp.RequestCtx {
+// call runs the handler directly, without a network socket.
+func call(method, uri string, body []byte) *fasthttp.RequestCtx {
 	var ctx fasthttp.RequestCtx
 	ctx.Request.Header.SetMethod(method)
 	ctx.Request.SetRequestURI(uri)
-	if len(body) > 0 {
-		ctx.Request.SetBody(body)
-	}
-	fastHandler(&ctx)
+	ctx.Request.SetBody(body)
+	handler(&ctx)
 	return &ctx
 }
 
-func assertValidJSON(t *testing.T, data []byte) {
+func mustJSON(t *testing.T, b []byte, v any) {
 	t.Helper()
-	var js any
-	if err := json.Unmarshal(data, &js); err != nil {
-		t.Fatalf("Expected valid JSON, got unmarshal error: %v. Raw body: %s", err, string(data))
+	if v == nil {
+		v = new(any)
+	}
+	if err := json.Unmarshal(b, v); err != nil {
+		t.Fatalf("invalid JSON %q: %v", b, err)
 	}
 }
 
-func TestEndpoints_ValidJSON(t *testing.T) {
-	os.Setenv("ALLOW_NO_DB", "1")
-	defer os.Unsetenv("ALLOW_NO_DB")
-
-	dummyVal := `dummy_code_value`
-	memoryStore[42].Store(&dummyVal)
-
-	tests := []struct {
-		name       string
-		method     string
-		uri        string
-		body       []byte
-		wantStatus int
-	}{
-		{
-			name:       "/livez returns 200 and valid JSON",
-			method:     "GET",
-			uri:        "/livez",
-			wantStatus: 200,
-		},
-		{
-			name:       "/readyz returns valid JSON",
-			method:     "GET",
-			uri:        "/readyz",
-			wantStatus: 503,
-		},
-		{
-			name:       "/code-fast with existing ID returns 200 and valid JSON",
-			method:     "GET",
-			uri:        "/code-fast?id=42",
-			wantStatus: 200,
-		},
-		{
-			name:       "/code-fast with out-of-range ID returns 404 and valid JSON",
-			method:     "GET",
-			uri:        "/code-fast?id=10000000",
-			wantStatus: 404,
-		},
-		{
-			name:       "/code-fast with not found ID returns 404 and valid JSON",
-			method:     "GET",
-			uri:        "/code-fast?id=999999",
-			wantStatus: 404,
-		},
-		{
-			name:       "/code-write returns 202 and valid JSON",
-			method:     "POST",
-			uri:        "/code-write",
-			body:       []byte("test code content"),
-			wantStatus: 202,
-		},
-		{
-			name:       "Unknown path returns 404 and valid JSON",
-			method:     "GET",
-			uri:        "/non-existent-path",
-			wantStatus: 404,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := invokeFastHandler(tc.method, tc.uri, tc.body)
-			if ctx.Response.StatusCode() != tc.wantStatus {
-				t.Errorf("got status %d, want %d (body: %s)", ctx.Response.StatusCode(), tc.wantStatus, string(ctx.Response.Body()))
-			}
-			assertValidJSON(t, ctx.Response.Body())
-		})
-	}
-}
-
-func TestPayloadVariations_RoundTrip(t *testing.T) {
-	os.Setenv("ALLOW_NO_DB", "1")
-	defer os.Unsetenv("ALLOW_NO_DB")
-
-	payloads := []string{
-		`Simple ASCII payload`,
-		`He said, "Hello, World!" with quotes`,
-		`C:\Users\Username\Documents\Path\With\Backslashes`,
-		"Multi-line string\nSecond line\r\nThird line\tend",
-		`Unicode:  Rocket, 100€ Euro, 日本語 Japanese, Español, Über, 1/2 ½`,
-		`{"nested":"json","escaped":"\"quotes\"","flag":true}`,
-	}
-
-	for i, payload := range payloads {
-		t.Run("Payload_"+strconv.Itoa(i), func(t *testing.T) {
-
-			ctxWrite := invokeFastHandler("POST", "/code-write", []byte(payload))
-			if ctxWrite.Response.StatusCode() != 202 {
-				t.Fatalf("POST /code-write failed with status %d: %s", ctxWrite.Response.StatusCode(), string(ctxWrite.Response.Body()))
-			}
-
-			assertValidJSON(t, ctxWrite.Response.Body())
-
-			var writeResp struct {
-				Status string `json:"status"`
-				ID     int64  `json:"id"`
-			}
-			if err := json.Unmarshal(ctxWrite.Response.Body(), &writeResp); err != nil {
-				t.Fatalf("failed to unmarshal write response: %v", err)
-			}
-			if writeResp.ID <= 0 {
-				t.Fatalf("expected positive ID, got %d", writeResp.ID)
-			}
-
-			ctxRead := invokeFastHandler("GET", "/code-fast?id="+strconv.FormatInt(writeResp.ID, 10), nil)
-			if ctxRead.Response.StatusCode() != 200 {
-				t.Fatalf("GET /code-fast failed with status %d: %s", ctxRead.Response.StatusCode(), string(ctxRead.Response.Body()))
-			}
-
-			assertValidJSON(t, ctxRead.Response.Body())
-
-			var readResp struct {
-				ID   int64  `json:"id"`
-				Code string `json:"code"`
-			}
-			if err := json.Unmarshal(ctxRead.Response.Body(), &readResp); err != nil {
-				t.Fatalf("failed to unmarshal read response: %v", err)
-			}
-
-			if readResp.ID != writeResp.ID {
-				t.Errorf("ID mismatch: got %d, want %d", readResp.ID, writeResp.ID)
-			}
-			if readResp.Code != payload {
-				t.Errorf("Payload mismatch!\nGot:  %q\nWant: %q", readResp.Code, payload)
-			}
-		})
-	}
-}
-
-func TestBadInputs(t *testing.T) {
-	os.Setenv("ALLOW_NO_DB", "1")
-	defer os.Unsetenv("ALLOW_NO_DB")
-
-	t.Run("NUL byte in body -> 400", func(t *testing.T) {
-		ctx := invokeFastHandler("POST", "/code-write", []byte("hello\x00world"))
-		if ctx.Response.StatusCode() != 400 {
-			t.Errorf("got status %d, want 400", ctx.Response.StatusCode())
-		}
-		assertValidJSON(t, ctx.Response.Body())
-	})
-
-	t.Run("Invalid UTF-8 in body -> 400", func(t *testing.T) {
-		ctx := invokeFastHandler("POST", "/code-write", []byte{0xff, 0xfe, 0xfd})
-		if ctx.Response.StatusCode() != 400 {
-			t.Errorf("got status %d, want 400", ctx.Response.StatusCode())
-		}
-		assertValidJSON(t, ctx.Response.Body())
-	})
-
-	t.Run("Body > 4096 bytes -> 413", func(t *testing.T) {
-		largeBody := make([]byte, 4097)
-		for i := range largeBody {
-			largeBody[i] = 'a'
-		}
-		ctx := invokeFastHandler("POST", "/code-write", largeBody)
-		if ctx.Response.StatusCode() != 413 {
-			t.Errorf("got status %d, want 413", ctx.Response.StatusCode())
-		}
-		assertValidJSON(t, ctx.Response.Body())
-	})
-
-	invalidIDs := []string{"0", "-1", "-999", "abc", "", "1.5"}
-	for _, idStr := range invalidIDs {
-		t.Run("Invalid ID "+idStr+" -> 400", func(t *testing.T) {
-			ctxFast := invokeFastHandler("GET", "/code-fast?id="+idStr, nil)
-			if ctxFast.Response.StatusCode() != 400 {
-				t.Errorf("/code-fast with id=%q: got status %d, want 400", idStr, ctxFast.Response.StatusCode())
-			}
-			assertValidJSON(t, ctxFast.Response.Body())
-
-			ctxRedis := invokeFastHandler("GET", "/code-redis?id="+idStr, nil)
-			if ctxRedis.Response.StatusCode() != 400 {
-				t.Errorf("/code-redis with id=%q: got status %d, want 400", idStr, ctxRedis.Response.StatusCode())
-			}
-			assertValidJSON(t, ctxRedis.Response.Body())
-
-			ctxDB := invokeFastHandler("GET", "/code-db?id="+idStr, nil)
-			if ctxDB.Response.StatusCode() != 400 {
-				t.Errorf("/code-db with id=%q: got status %d, want 400", idStr, ctxDB.Response.StatusCode())
-			}
-			assertValidJSON(t, ctxDB.Response.Body())
-		})
-	}
-}
-
-func TestDBPoolNil_WritesDisabled(t *testing.T) {
-
-	os.Unsetenv("ALLOW_NO_DB")
-	originalPool := dbPool
-	dbPool = nil
-	defer func() { dbPool = originalPool }()
-
-	ctx := invokeFastHandler("POST", "/code-write", []byte("sample"))
-	if ctx.Response.StatusCode() != 503 {
-		t.Errorf("Expected 503 when dbPool is nil and ALLOW_NO_DB unset, got %d", ctx.Response.StatusCode())
-	}
-	assertValidJSON(t, ctx.Response.Body())
-}
-
-func TestPprofAndMetrics(t *testing.T) {
-	mux := setupDebugMux()
-
-	reqPprof := httptest.NewRequest("GET", "/debug/pprof/", nil)
-	recPprof := httptest.NewRecorder()
-	mux.ServeHTTP(recPprof, reqPprof)
-	if recPprof.Code != http.StatusOK {
-		t.Errorf("GET /debug/pprof/ returned %d, want 200", recPprof.Code)
-	}
-
-	reqMetrics := httptest.NewRequest("GET", "/metrics", nil)
-	recMetrics := httptest.NewRecorder()
-	mux.ServeHTTP(recMetrics, reqMetrics)
-	if recMetrics.Code != http.StatusOK {
-		t.Errorf("GET /metrics returned %d, want 200", recMetrics.Code)
-	}
-	assertValidJSON(t, recMetrics.Body.Bytes())
-
-	var m MetricsResponse
-	if err := json.Unmarshal(recMetrics.Body.Bytes(), &m); err != nil {
-		t.Fatalf("failed to unmarshal /metrics response: %v", err)
-	}
-	if !m.InvariantHolds {
-		t.Errorf("Metrics invariant holds is false: %+v", m)
-	}
-}
-
-func TestAccountingInvariant(t *testing.T) {
-
-drainLoop:
+func drainQueue() {
 	for {
 		select {
 		case <-writeQueue:
 		default:
-			break drainLoop
+			return
 		}
 	}
+}
 
-	atomic.StoreInt64(&acceptedWrites, 0)
-	atomic.StoreInt64(&rejectedFullWrites, 0)
-	atomic.StoreInt64(&dequeuedWrites, 0)
-	atomic.StoreInt64(&persistedWrites, 0)
-	atomic.StoreInt64(&failedWrites, 0)
-	atomic.StoreInt64(&pendingInBatches, 0)
-
-	m0 := getMetrics()
-	if !m0.InvariantHolds {
-		t.Fatalf("Baseline invariant failed: %+v", m0)
-	}
-
-	for i := int64(1); i <= 10; i++ {
-		writeQueue <- Item{ID: i, RawCode: "code", EscapedCode: "code"}
-		atomic.AddInt64(&acceptedWrites, 1)
-	}
-	m1 := getMetrics()
-	if !m1.InvariantHolds || m1.Accepted != 10 || m1.QueueDepth != 10 {
-		t.Errorf("Step 1 invariant failed: %+v", m1)
-	}
-
-	for i := 0; i < 6; i++ {
-		<-writeQueue
-		atomic.AddInt64(&dequeuedWrites, 1)
-		atomic.AddInt64(&pendingInBatches, 1)
-	}
-	m2 := getMetrics()
-	if !m2.InvariantHolds || m2.PendingInBatches != 6 || m2.QueueDepth != 4 {
-		t.Errorf("Step 2 invariant failed: %+v", m2)
-	}
-
-	atomic.AddInt64(&persistedWrites, 4)
-	atomic.AddInt64(&pendingInBatches, -4)
-
-	atomic.AddInt64(&failedWrites, 2)
-	atomic.AddInt64(&pendingInBatches, -2)
-
-	m3 := getMetrics()
-	if !m3.InvariantHolds || m3.Persisted != 4 || m3.Failed != 2 || m3.PendingInBatches != 0 || m3.QueueDepth != 4 {
-		t.Errorf("Step 3 invariant failed: %+v", m3)
-	}
-
-	for i := 0; i < 4; i++ {
-		<-writeQueue
-		atomic.AddInt64(&dequeuedWrites, 1)
-		atomic.AddInt64(&pendingInBatches, 1)
-	}
-	atomic.AddInt64(&persistedWrites, 4)
-	atomic.AddInt64(&pendingInBatches, -4)
-
-	m4 := getMetrics()
-	if !m4.InvariantHolds || m4.Persisted != 8 || m4.Failed != 2 || m4.QueueDepth != 0 || m4.PendingInBatches != 0 {
-		t.Errorf("Step 4 invariant failed: %+v", m4)
+func resetStats() {
+	drainQueue()
+	for _, c := range []interface{ Store(int64) }{
+		&stats.accepted, &stats.rejected, &stats.persisted, &stats.failed, &stats.pending, &stats.redisErrors,
+	} {
+		c.Store(0)
 	}
 }
 
-func TestErrorClassification_PermanentVsTransient(t *testing.T) {
+func TestRoutes(t *testing.T) {
+	t.Setenv("ALLOW_NO_DB", "1")
+	v := "dummy"
+	memoryStore[42].Store(&v)
 
-	pgErr22 := &pgconn.PgError{Code: "22001"}
-	if !isPermanentError(pgErr22) {
-		t.Errorf("expected pgErr 22001 to be classified as permanent")
+	tests := []struct {
+		method, uri string
+		body        string
+		want        int
+	}{
+		{"GET", "/simple", "", 200},
+		{"GET", "/livez", "", 200},
+		{"GET", "/readyz", "", 503}, // no DB/Redis in unit tests
+		{"GET", "/code-fast?id=42", "", 200},
+		{"GET", "/code-fast?id=999999", "", 404},
+		{"GET", "/code-fast?id=10000000", "", 404},
+		{"GET", "/code-redis?id=42", "", 503},
+		{"GET", "/code-db?id=42", "", 503},
+		{"POST", "/code-write", "hello", 202},
+		{"POST", "/simple", "", 404},
+		{"GET", "/nope", "", 404},
 	}
-
-	pgErr23 := &pgconn.PgError{Code: "23505"}
-	if !isPermanentError(pgErr23) {
-		t.Errorf("expected pgErr 23505 to be classified as permanent")
-	}
-
-	pgErr40 := &pgconn.PgError{Code: "40001"}
-	if isPermanentError(pgErr40) {
-		t.Errorf("expected pgErr 40001 to be classified as transient")
-	}
-
-	pgErr08 := &pgconn.PgError{Code: "08006"}
-	if isPermanentError(pgErr08) {
-		t.Errorf("expected pgErr 08006 to be classified as transient")
-	}
-}
-
-func BenchmarkHandler_Simple(b *testing.B) {
-	var ctx fasthttp.RequestCtx
-	ctx.Request.Header.SetMethod("GET")
-	ctx.Request.SetRequestURI("/simple")
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		fastHandler(&ctx)
+	for _, tc := range tests {
+		ctx := call(tc.method, tc.uri, []byte(tc.body))
+		if got := ctx.Response.StatusCode(); got != tc.want {
+			t.Errorf("%s %s = %d, want %d (%s)", tc.method, tc.uri, got, tc.want, ctx.Response.Body())
+		}
+		if tc.uri != "/simple" {
+			mustJSON(t, ctx.Response.Body(), nil)
+		}
 	}
 }
 
-func BenchmarkHandler_CodeFast(b *testing.B) {
-	val := `{"id":42,"code":"bench_test_payload"}`
-	memoryStore[42].Store(&val)
+// Writes with tricky characters must come back byte-for-byte from /code-fast.
+func TestWriteThenRead(t *testing.T) {
+	t.Setenv("ALLOW_NO_DB", "1")
+	payloads := []string{
+		`plain`,
+		`He said "hi"`,
+		`C:\path\with\backslashes`,
+		"lines\nand\r\ntabs\t",
+		`Unicode: 🚀 100€ 日本語`,
+		`{"nested":"json"}`,
+	}
+	for _, p := range payloads {
+		w := call("POST", "/code-write", []byte(p))
+		var wr struct{ ID int64 }
+		mustJSON(t, w.Response.Body(), &wr)
 
-	var ctx fasthttp.RequestCtx
-	ctx.Request.Header.SetMethod("GET")
-	ctx.Request.SetRequestURI("/code-fast?id=42")
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		fastHandler(&ctx)
+		r := call("GET", "/code-fast?id="+strconv.FormatInt(wr.ID, 10), nil)
+		var rr struct {
+			ID   int64
+			Code string
+		}
+		mustJSON(t, r.Response.Body(), &rr)
+		if rr.ID != wr.ID || rr.Code != p {
+			t.Errorf("round trip: got (%d,%q), want (%d,%q)", rr.ID, rr.Code, wr.ID, p)
+		}
 	}
 }
 
-func BenchmarkHandler_CodeRedis_Hit(b *testing.B) {
-
-	val := "mock_redis_cached_code"
-	memoryStore[42].Store(&val)
-
-	var ctx fasthttp.RequestCtx
-	ctx.Request.Header.SetMethod("GET")
-	ctx.Request.SetRequestURI("/code-redis?id=42")
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		fastHandler(&ctx)
+func TestBadInputs(t *testing.T) {
+	t.Setenv("ALLOW_NO_DB", "1")
+	bodies := map[string]int{
+		"hello\x00world":          400, // NUL byte
+		"\xff\xfe":                400, // invalid UTF-8
+		strings.Repeat("a", 4097): 413, // too large
 	}
-}
-
-func BenchmarkHandler_CodeWrite_CustomBody(b *testing.B) {
-	os.Setenv("ALLOW_NO_DB", "1")
-	defer os.Unsetenv("ALLOW_NO_DB")
-
-	stopDrain := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-writeQueue:
-			case <-stopDrain:
-				return
+	for body, want := range bodies {
+		if got := call("POST", "/code-write", []byte(body)).Response.StatusCode(); got != want {
+			t.Errorf("POST %q... = %d, want %d", body[:4], got, want)
+		}
+	}
+	for _, id := range []string{"0", "-1", "abc", "", "1.5", "20000000000000000000"} {
+		for _, route := range []string{"/code-fast", "/code-redis", "/code-db"} {
+			ctx := call("GET", route+"?id="+id, nil)
+			if ctx.Response.StatusCode() != 400 {
+				t.Errorf("%s?id=%s = %d, want 400", route, id, ctx.Response.StatusCode())
 			}
+			mustJSON(t, ctx.Response.Body(), nil)
 		}
-	}()
-	defer close(stopDrain)
+	}
+}
 
+func TestWritesNeedDB(t *testing.T) {
+	os.Unsetenv("ALLOW_NO_DB")
+	if got := call("POST", "/code-write", []byte("x")).Response.StatusCode(); got != 503 {
+		t.Errorf("write without DB = %d, want 503", got)
+	}
+}
+
+func TestParsePositiveInt64(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"42", 42, true},
+		{"9223372036854775807", 9223372036854775807, true}, // MaxInt64
+		{"9223372036854775808", 0, false},                  // MaxInt64 + 1
+		{"20000000000000000000", 0, false},                 // would wrap to a positive number
+		{"0", 0, false},
+	}
+	for _, tc := range tests {
+		if got, ok := parsePositiveInt64([]byte(tc.in)); got != tc.want || ok != tc.ok {
+			t.Errorf("parse(%q) = (%d,%v), want (%d,%v)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// Walks items through queue -> pending -> persisted/failed and checks the
+// invariant at each step, then proves a lost item is detected.
+func TestInvariant(t *testing.T) {
+	resetStats()
+	defer resetStats()
+
+	for i := range 10 {
+		writeQueue <- Item{ID: int64(i + 1)}
+		stats.accepted.Add(1)
+	}
+	for range 6 { // a worker takes 6
+		<-writeQueue
+		stats.pending.Add(1)
+	}
+	stats.pending.Add(-6) // 4 saved, 2 failed
+	stats.persisted.Add(4)
+	stats.failed.Add(2)
+
+	if m := snapshot(); !m.InvariantHolds || m.QueueDepth != 4 {
+		t.Fatalf("invariant should hold: %+v", m)
+	}
+
+	<-writeQueue // an item disappears without being counted
+	if m := snapshot(); m.InvariantHolds || m.Unaccounted != 1 {
+		t.Fatalf("lost item not detected: %+v", m)
+	}
+}
+
+func TestFailedWriteEvictedFromL1(t *testing.T) {
+	resetStats()
+	defer resetStats()
+	const id = 777
+	old := "old"
+	memoryStore[id].Store(&old)
+	stats.pending.Add(1)
+	flush([]Item{{ID: id, memPtr: &old}}) // dbPool is nil -> fails
+	if memoryStore[id].Load() != nil {
+		t.Fatal("failed write still in L1")
+	}
+
+	// A newer value must survive an older write's failure.
+	newer := "new"
+	memoryStore[id].Store(&newer)
+	stats.pending.Add(1)
+	flush([]Item{{ID: id, memPtr: &old}})
+	if p := memoryStore[id].Load(); p == nil || *p != "new" {
+		t.Fatal("newer value wrongly evicted")
+	}
+	memoryStore[id].Store(nil)
+}
+
+func TestIsPermanent(t *testing.T) {
+	for code, want := range map[string]bool{"22001": true, "23505": true, "40001": false, "08006": false} {
+		if got := isPermanent(&pgconn.PgError{Code: code}); got != want {
+			t.Errorf("isPermanent(%s) = %v, want %v", code, got, want)
+		}
+	}
+}
+
+func TestGetEnvExactKey(t *testing.T) {
+	t.Chdir(t.TempDir())
+	os.WriteFile(".env", []byte("PORTAL=9999\nPORT=8081\n"), 0644)
+	t.Setenv("PORT", "")
+	if got := getEnv("PORT", "x"); got != "8081" {
+		t.Fatalf("getEnv(PORT) = %q, want 8081", got)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	resetStats()
+	for _, path := range []string{"/metrics", "/debug/pprof/"} {
+		rec := httptest.NewRecorder()
+		debugMux().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != 200 {
+			t.Errorf("GET %s = %d", path, rec.Code)
+		}
+	}
+}
+
+// ---- benchmarks: the read paths must report 0 allocs/op ----
+
+func bench(b *testing.B, method, uri string, body []byte) {
 	var ctx fasthttp.RequestCtx
-	ctx.Request.Header.SetMethod("POST")
-	ctx.Request.SetRequestURI("/code-write")
-	body := []byte("bench write payload")
+	ctx.Request.Header.SetMethod(method)
+	ctx.Request.SetRequestURI(uri)
 	ctx.Request.SetBody(body)
-
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		fastHandler(&ctx)
+	for b.Loop() {
+		handler(&ctx)
 	}
 }
 
-func BenchmarkHandler_CodeWrite_EmptyBody(b *testing.B) {
-	os.Setenv("ALLOW_NO_DB", "1")
-	defer os.Unsetenv("ALLOW_NO_DB")
+func BenchmarkSimple(b *testing.B) { bench(b, "GET", "/simple", nil) }
 
-	stopDrain := make(chan struct{})
-	go func() {
+func BenchmarkCodeFast(b *testing.B) {
+	v := "bench_payload"
+	memoryStore[42].Store(&v)
+	bench(b, "GET", "/code-fast?id=42", nil)
+}
+
+func BenchmarkCodeWrite(b *testing.B) {
+	b.Setenv("ALLOW_NO_DB", "1")
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // stand-in for the batch workers
 		for {
 			select {
 			case <-writeQueue:
-			case <-stopDrain:
+			case <-stop:
 				return
 			}
 		}
 	}()
-	defer close(stopDrain)
+	bench(b, "POST", "/code-write", []byte("bench write payload"))
+}
 
+// Guards the old /code-db bug where the closing quote after "code" was missing.
+func TestWriteRecordJSON(t *testing.T) {
 	var ctx fasthttp.RequestCtx
-	ctx.Request.Header.SetMethod("POST")
-	ctx.Request.SetRequestURI("/code-write")
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		fastHandler(&ctx)
+	writeRecord(&ctx, 7, `a\"b`, "postgresql")
+	var r struct {
+		ID           int64
+		Code, Source string
+	}
+	mustJSON(t, ctx.Response.Body(), &r)
+	if r.ID != 7 || r.Code != `a"b` || r.Source != "postgresql" {
+		t.Fatalf("got %+v", r)
 	}
 }
