@@ -8,7 +8,7 @@ local base_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567
 local special_snippets = {
     "He said: \"High throughput engineering in Go is remarkable!\"\n",
     "Path: C:\\Program Files\\Go\\src\\database\\sql\r\n",
-    "Unicode: 🚀 Rocket, 100€ Euro, 日本語, Español ñ á, ⚡ Lightning\n",
+    "Unicode:  Rocket, 100€ Euro, 日本語, Español ñ á, ⚡ Lightning\n",
     "{\"tag\": \"metric\", \"valid\": true, \"quoted\": \"escaped \\\"text\\\"\"}\n",
     "Log message with multiple\nlines and tabs\t\t[DEBUG]\n",
 }

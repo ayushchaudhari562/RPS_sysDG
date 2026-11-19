@@ -21,7 +21,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/reuseport"
 )
